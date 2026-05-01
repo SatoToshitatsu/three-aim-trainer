@@ -558,8 +558,10 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
 import {
   getFirestore,
   collection,
-  addDoc,
+  doc,
+  getDoc,
   getDocs,
+  setDoc,
   query,
   where,
   orderBy,
@@ -701,6 +703,23 @@ if (firebaseReady) {
   let currentLeaderboardWeapon = 'handgun';
   let scoreSubmittedThisRun = false;
 
+  function getPlayerId() {
+    let playerId = localStorage.getItem('threeAimTrainerPlayerId');
+    if (!playerId) {
+      if (window.crypto && crypto.randomUUID) {
+        playerId = crypto.randomUUID();
+      } else {
+        playerId = 'player-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      }
+      localStorage.setItem('threeAimTrainerPlayerId', playerId);
+    }
+    return playerId;
+  }
+
+  function makeScoreDocId(weapon, playerId) {
+    return `${weapon}_${String(playerId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  }
+
   function escapeHtml(text) {
     return String(text)
       .replaceAll('&', '&amp;')
@@ -741,13 +760,23 @@ if (firebaseReady) {
         collection(db, 'scores'),
         where('weapon', '==', weapon),
         orderBy('score', 'desc'),
-        limit(5)
+        limit(50)
       );
       const snapshot = await getDocs(q);
       const scores = [];
-      snapshot.forEach(doc => scores.push(doc.data()));
-      renderLeaderboard(scores);
-      if (ui.leaderboardStatus) ui.leaderboardStatus.textContent = 'Firestore: connected';
+      const usedPlayers = new Set();
+
+      snapshot.forEach(scoreDoc => {
+        const data = scoreDoc.data();
+        const playerKey = data.playerId || String(data.name || 'PLAYER').trim().toLowerCase();
+        if (!usedPlayers.has(playerKey)) {
+          usedPlayers.add(playerKey);
+          scores.push(data);
+        }
+      });
+
+      renderLeaderboard(scores.slice(0, 5));
+      if (ui.leaderboardStatus) ui.leaderboardStatus.textContent = 'Firestore: connected / 1 player = 1 rank';
     } catch (error) {
       console.error('Leaderboard load failed:', error);
       if (ui.leaderboardList) ui.leaderboardList.innerHTML = '<li>ランキング取得エラー。Consoleを確認。</li>';
@@ -773,15 +802,33 @@ if (firebaseReady) {
 
       const accuracy = state.shots > 0 ? Math.round((state.hits / state.shots) * 100) : 0;
       const weapon = String(currentWeapon || 'handgun').toLowerCase();
+      const playerId = getPlayerId();
+      const scoreDocRef = doc(db, 'scores', makeScoreDocId(weapon, playerId));
+      const previousScoreDoc = await getDoc(scoreDocRef);
+      const previousScore = previousScoreDoc.exists() ? Number(previousScoreDoc.data().score || 0) : 0;
+      const currentScore = Math.floor(state.score || 0);
 
-      await addDoc(collection(db, 'scores'), {
+      if (previousScoreDoc.exists() && currentScore <= previousScore) {
+        scoreSubmittedThisRun = true;
+        if (ui.submitScoreButton) {
+          ui.submitScoreButton.disabled = true;
+          ui.submitScoreButton.textContent = 'NOT BEST';
+        }
+        await loadLeaderboard(weapon);
+        alert('自己ベストを更新していないため、ランキングは更新されませんでした。現在の自己ベスト: ' + previousScore + ' pts');
+        return;
+      }
+
+      await setDoc(scoreDocRef, {
+        playerId: playerId,
         weapon: weapon,
         name: cleanName,
-        score: Math.floor(state.score || 0),
+        score: currentScore,
         accuracy: Math.floor(accuracy || 0),
         combo: Math.floor(state.bestStreak || 0),
-        createdAt: serverTimestamp()
-      });
+        updatedAt: serverTimestamp(),
+        createdAt: previousScoreDoc.exists() ? previousScoreDoc.data().createdAt : serverTimestamp()
+      }, { merge: true });
 
       scoreSubmittedThisRun = true;
       if (ui.submitScoreButton) {
@@ -789,7 +836,7 @@ if (firebaseReady) {
         ui.submitScoreButton.textContent = 'SUBMITTED';
       }
       await loadLeaderboard(weapon);
-      alert('スコアを登録しました！');
+      alert(previousScoreDoc.exists() ? '自己ベストを更新しました！' : 'スコアを登録しました！');
     } catch (error) {
       console.error('Score submit failed:', error);
       alert('スコア送信に失敗しました。Consoleを確認してください。');
